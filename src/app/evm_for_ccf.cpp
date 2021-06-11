@@ -7,6 +7,7 @@
 #include "ds/logger.h"
 #include "ethereum_state.h"
 #include "ethereum_transaction.h"
+#include "fmt/format.h"
 #include "http/http_status.h"
 #include "jsonrpc.h"
 #include "tables.h"
@@ -29,6 +30,7 @@
 // STL/3rd-party
 #include <iostream>
 #include <msgpack/msgpack.hpp>
+#include <stdint.h>
 #include <unistd.h>
 
 namespace evm4ccf
@@ -46,6 +48,9 @@ namespace evm4ccf
     tables::Accounts accounts;
     tables::Storage storage;
     tables::Results tx_results;
+    Address tee_addr;
+    tls::KeyPairPtr tee_kp;
+    size_t nonce = 0;
     WorkerQueue workerQueue;
     EthereumState make_state(kv::Tx& tx)
     {
@@ -304,7 +309,6 @@ namespace evm4ccf
       };
 
       auto send_multiPartyTransaction = [this](ccf::EndpointContext& args) {
-        CLOAK_DEBUG_FMT("request body:{}", args.rpc_ctx->get_request_body());
         const auto body_j =
           nlohmann::json::parse(args.rpc_ctx->get_request_body());
         auto smp = body_j.get<rpcparams::SendMultiPartyTransaction>();
@@ -323,6 +327,7 @@ namespace evm4ccf
         if (ct.has_value() && ct.value()->function.complete())
         {
           CloakTransaction *ct_value = ct.value();
+          ct_value->request_old_state();
           CLOAK_DEBUG_FMT("ct function: {}\n", ct_value->function.info());
           ct_value->set_status(PACKAGE);
           auto data = ct_value->function.packed_to_data();
@@ -338,8 +343,7 @@ namespace evm4ccf
           if (res.er == ExitReason::threw) {
               ct_value->set_status(FAILED);
           } else {
-              // TODO: add succeeded status
-              // ct_value->>set_status()
+              ct_value->set_status(SUCCEEDED);
           }
           // TODO: handle return result
         }
@@ -436,6 +440,53 @@ namespace evm4ccf
             account_state.acc.get_nonce()});
         };
 
+      auto sync_old_states = [this](ccf::EndpointContext& args) {
+          const auto body_j = nlohmann::json::parse(args.rpc_ctx->get_request_body());
+          auto sos = body_j.get<rpcparams::SyncOldStates>();
+          std::vector<void*> codes;
+          abicoder::paramCoder(codes, "read", "uint256[]", sos.old_states);
+          auto old_states_packed = abicoder::pack(codes);
+          auto old_states_hash = eevm::keccak_256(old_states_packed);
+
+          auto ct_opt = workerQueue.GetCloakTransaction(sos.mpt);
+          if (!ct_opt.has_value()) {
+              // TODO
+              return;
+          }
+          auto ct = ct_opt.value();
+          if (!ct->function.complete()) {
+              // TODO
+          }
+          ct->old_states = sos.old_states;
+          ct->old_states_hash = old_states_hash;
+          if (ct->request_public_keys()) {
+              // TODO
+              return;
+          }
+          execute_mpt(workerQueue, ct->old_states, sos.mpt, args.tx, tee_kp, nonce);
+      };
+    
+      auto sync_public_keys = [this](kv::Tx& tx, const nlohmann::json& params) {
+          auto tx_hash_vec = to_bytes(params["tx_hash"].get<std::string>());
+          h256 tx_hash;
+          std::copy(tx_hash_vec.begin(), tx_hash_vec.end(), tx_hash.begin());
+          auto ct_opt = workerQueue.GetCloakTransaction(tx_hash);
+          if (!ct_opt.has_value()) {
+              // TODO
+              return false;
+          }
+          auto ct = ct_opt.value();
+          std::map<std::string, std::string> public_keys;
+          auto public_key_list = params["public_keys"].get<std::vector<std::string>>();
+          for (size_t i = 0; i < public_key_list.size(); i++) {
+              public_keys.insert(std::make_pair(public_key_list[i], public_key_list[i+1]));
+          }
+          std::vector<std::string> decrypted = ct->decrypt_states(public_keys, tee_kp);
+          execute_mpt(workerQueue, decrypted, tx_hash, tx, tee_kp, nonce);
+          // TODO response
+          return true;
+      };
+
       // Because CCF OpenAPI json module do not support uint256, thus do not use
       // ccf::json_adapter(call) or add_auto_schema(...)
       make_endpoint(ethrpc::Call::name, HTTP_GET, call).install();
@@ -482,10 +533,22 @@ namespace evm4ccf
         .install();
 
       make_endpoint(
+        ethrpc::SyncOldStates::name,
+        HTTP_POST,
+        sync_old_states)
+        .install();
+
+      make_endpoint(
         "eth_getTransactionCount_Test",
         HTTP_GET,
         ccf::json_adapter(get_transaction_count_test))
         .set_auto_schema<ethrpc::GetTransactionCountTest>()
+        .install();
+
+      make_endpoint(
+        "eth_sync_public_keys",
+        HTTP_POST,
+        ccf::json_adapter(sync_public_keys))
         .install();
     }
 
@@ -501,6 +564,7 @@ namespace evm4ccf
       },
       storage("eth.storage"),
       tx_results("eth.txresults"),
+      tee_kp(tls::make_key_pair()),
       workerQueue(*nwt.tables)
     // SNIPPET_END: initialization
     {
@@ -609,6 +673,87 @@ namespace evm4ccf
       // {
       return exec_result;
       // }
+    }
+
+    void execute_mpt(
+        WorkerQueue& workerQueue,
+        const std::vector<std::string>& decryped_states,
+        h256 tx_hash,
+        kv::Tx& tx,
+        tls::KeyPairPtr kp,
+        size_t nonce) {
+        auto ct_opt = workerQueue.GetCloakTransaction(tx_hash);
+        if (!ct_opt.has_value()) {
+            // TODO
+            return;
+        }
+        auto ct = ct_opt.value();
+        MessageCall set_states_mc;
+        std::vector<void*> codes;
+        abicoder::paramCoder(codes, "set_states", "uint256[]", decryped_states);
+        auto decryped_states_packed = abicoder::pack(codes);
+        // TODO: function selector
+        auto set_states_call_data = eevm::to_bytes("");
+        set_states_call_data.insert(
+            set_states_call_data.begin(), decryped_states_packed.begin(), decryped_states_packed.end());
+        // TODO: from
+        // set_states_mc.from =
+        set_states_mc.to = ct->to;
+        set_states_mc.data = eevm::to_hex_string(set_states_call_data);
+        auto set_states_es = make_state(tx);
+        auto set_states_res = run_in_evm(set_states_mc, set_states_es).first;
+        if (set_states_res.er == ExitReason::threw) {
+            // TODO
+            return;
+        }
+        // run in evm
+        CLOAK_DEBUG_FMT("ct function: {}\n", ct->function.info());
+        auto data = ct->function.packed_to_data();
+        MessageCall mc;
+        mc.from = ct->from;
+        mc.to = ct->to;
+        mc.data = to_hex_string(data);
+        CLOAK_DEBUG_FMT("ct function data: {}", mc.data);
+        auto es = make_state(tx);
+
+        const auto res = run_in_evm(mc, es).first;
+        CLOAK_DEBUG_FMT("run in evm, res: {}, msg: {}\n", res.output, res.exmsg);
+        if (res.er == ExitReason::threw) {
+            ct->set_status(FAILED);
+        } else {
+            ct->set_status(SUCCEEDED);
+        }
+
+        // == get new states ==
+        MessageCall get_new_states_mc;
+        auto get_new_states_call_data = ct->get_states_call_data();
+        codes.clear();
+        // TODO: from
+        // set_states_mc.from =
+        set_states_mc.to = ct->to;
+        set_states_mc.data = eevm::to_hex_string(get_new_states_call_data);
+        auto get_new_states_es = make_state(tx);
+        auto get_new_states_res = run_in_evm(get_new_states_mc, get_new_states_es).first;
+        if (get_new_states_res.er == ExitReason::threw) {
+            // TODO
+            return;
+        }
+
+        // decode result
+        std::vector<uint8_t> output = get_new_states_res.output;
+        std::vector<uint8_t> count_vec(output.begin()+32, output.begin()+64);
+        std::vector<std::string> new_states;
+        size_t count = to_uint64(to_hex_string(count_vec));
+        for (size_t i = 0; i < count; i++) {
+            auto it = output.begin()+64+i*256;
+            std::vector<uint8_t> state(it, it+256);
+            new_states.push_back(to_hex_string(state));
+        }
+
+        // == Sync new states ==
+        auto encrypted = ct->encrypt_states(new_states, kp);
+        ct->sync_result(encrypted, kp, nonce);
+        // TODO response
     }
 
     static std::tuple<ExecResult, TxHash, Address> execute_transaction(

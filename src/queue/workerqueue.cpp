@@ -22,14 +22,12 @@ h256 WorkerQueue::addModule( PrivacyPolicyTransaction& tx) {
     auto view = storage.get_views(txStorage).privacy;
     view->put(txHash, tx);
     modules[tx.to] = txHash;
-    cout << "添加一个隐私模型，HASH为：" << tx.to_hex_hash() << endl;
     return txHash;
 }
 // 删除交易
 bool WorkerQueue::drop(const h256& hash) {
     auto t = workerQueue.find(hash);
     if( t == workerQueue.end()) return false;
-    cout << "删除一笔交易" << endl;
     workerQueue.erase(t);
     return true;
 }
@@ -48,7 +46,6 @@ h256 WorkerQueue::addMultiParty(MultiPartyTransaction &mpt) {
     }
 
     // 添加交易
-    cout << "添加新交易"<< endl;
     CloakTransaction ct;
     ppt.value().to_privacyPolicyModules_call(ct, mpt.name());
     ct.insert(mpt);

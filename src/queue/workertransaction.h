@@ -1,8 +1,12 @@
 #pragma once
+#include "crypto/symmetric_key.h"
 #include "ds/logger.h"
 #include "fmt/core.h"
+#include "fmt/locale.h"
 #include "iostream"
+#include "nlohmann/json.hpp"
 #include "string"
+#include "tls/key_pair.h"
 #include "vector"
 #include "../app/utils.h"
 #include "map"
@@ -11,6 +15,8 @@
 #include <eEVM/bigint.h>
 #include <eEVM/rlp.h>
 #include <eEVM/util.h>
+#include <memory>
+#include <regex>
 #include <stdexcept>
 #include "ethereum_transaction.h"
 #include "../msgpack/address.h"
@@ -31,14 +37,16 @@ namespace evm4ccf
         PENDING,
         PACKAGE,
         DROPPED,
-        FAILED
+        FAILED,
+        SUCCEEDED,
     };
 
     static std::map<Status,ByteData> statusMap = {
         {PENDING, "pending"},
         {PACKAGE, "package"},
         {DROPPED, "dropped"},
-        {FAILED, "failed"}
+        {FAILED, "failed"},
+        {SUCCEEDED, "succeeded"},
     };
 
     struct MultiPartyTransaction
@@ -103,8 +111,11 @@ namespace evm4ccf
         Address             from;
         Address             to;
         Address             verifierAddr;
+        Address             tee_addr;
         ByteData            codeHash;
         policy::Function    function;
+        std::vector<std::string> old_states;
+        h256 old_states_hash;
         std::vector<policy::Params> states;
         Status              status = PENDING;
         std::map<Address, MultiPartyTransaction> multiParty ;
@@ -132,6 +143,203 @@ namespace evm4ccf
 
         void set_status(Status status) {
             this->status = status;
+        }
+
+        std::string make_var_function_selector(const std::string& name) {
+            auto sha3 = eevm::keccak_256(name+"()");
+            return Utils::BinaryToHex(std::string(sha3.begin(), sha3.begin() + 4));
+        }
+
+        void request_old_state() {
+            auto data = get_states_call_data();
+            std::string msg = fmt::format(
+                "{} \"from\":\"{}\", \"to\":\"{}\", \"data\":\"{}\", \"tx_hash\": \"{}\" {}",
+                "{",
+                to_hex_string(from),
+                to_hex_string(from),
+                to_hex_string(data),
+                to_hex_string(hash()),
+                "}");
+            Utils::cloak_agent_log("request_old_state", msg);
+        }
+
+        std::vector<uint8_t> get_states_call_data() {
+            CLOAK_DEBUG_FMT("begin request old state");
+            std::vector<std::string> param;
+            for (size_t i = 0; i < states.size(); i++) {
+                auto state = states[i];
+                std::smatch match;
+                if (!std::regex_match(state.type, match, std::regex(patternMapping))) {
+                    continue;
+                }
+                param.push_back(to_hex_string(i));
+                for (auto&& read_param : function.read) {
+                    if (read_param.name == state.name) {
+                        param.push_back(to_hex_string(read_param.keys.size()));
+                        for (auto&& k : read_param.keys) {
+                            for (auto&& input : function.inputs) {
+                                if (input.name == k) {
+                                    param.push_back(input.value.value());
+                                }
+                            }
+                        }
+                    }
+                }
+                for (auto&& mutate_param : function.mutate) {
+                    if (mutate_param.name == state.name) {
+                        param.push_back(to_hex_string(mutate_param.keys.size()));
+                        for (auto&& k : mutate_param.keys) {
+                            for (auto&& input : function.inputs) {
+                                if (input.name == k) {
+                                    param.push_back(input.value.value());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (auto&& p : param) {
+                CLOAK_DEBUG_FMT("param:{}", p);
+            }
+            // function selector
+            std::vector<uint8_t> data = to_bytes("0xecb60960");
+            if (!param.empty()) {
+                std::vector<void*> codes;
+                abicoder::paramCoder(codes, "read", "uint256[]", param);
+                auto packed = abicoder::pack(codes);
+                data.insert(data.begin(), packed.begin(), packed.end());
+            }
+            return data;
+        }
+
+        std::vector<std::string> encrypt_states(const std::vector<std::string>& new_states, tls::KeyPairPtr kp) {
+            std::vector<std::string> res;
+            for (size_t i = 0; i < new_states.size();) {
+                auto id = to_uint64(new_states[i]);
+                // policy state
+                auto ps = states[id];
+                if (ps.owner == "all") {
+                    res.insert(res.end(), {new_states[i], new_states[i+1]});
+                    i += 2;
+                } else if (ps.owner[0] == '0') {
+                    auto iv = tls::create_entropy()->random(crypto::GCM_SIZE_IV);
+                    auto decrypted = Utils::encrypt_data(kp, ps.owner, iv, to_bytes(new_states[i+1]));
+                    res.insert(res.end(), {new_states[i], to_hex_string(decrypted), to_hex_string(iv), ps.owner});
+                    i += 2;
+
+                } else if (ps.owner[0] == 'm') {
+                    auto mapping_keys = function.get_mapping_keys(ps.name);
+                    res.insert(res.end(), {new_states[i], new_states[i+1]});
+                    for (size_t j = 0; j < mapping_keys.size(); j++) {
+                        size_t pos = i + 2 + j;
+                        auto iv = tls::create_entropy()->random(crypto::GCM_SIZE_IV);
+                        auto decrypted = Utils::encrypt_data(kp, mapping_keys[j], iv, to_bytes(new_states[pos]));
+                        res.insert(res.end(), {to_hex_string(decrypted), to_hex_string(iv), mapping_keys[j]});
+                    }
+                    i += 2 + mapping_keys.size();
+                } else {
+                    LOG_AND_THROW("don't support owner:{}", ps.owner);
+                }
+            }
+            return res;
+        }
+
+        std::vector<std::string> decrypt_states(const std::map<std::string, std::string>& public_keys, tls::KeyPairPtr kp) {
+            std::vector<std::string> res;
+            for (size_t i = 0; i < old_states.size();) {
+                res.push_back(old_states[i]);
+                auto id = to_uint256(old_states[i]);
+                auto p = states.at(size_t(id));
+                if (p.owner == "all") {
+                    if (p.type[0] != 'm' && p.type[0] != 'a') {
+                        res.push_back(old_states[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    auto size = size_t(to_uint256(old_states[i + 1]));
+                    res.insert(res.begin(), old_states.begin() + i + 1, old_states.begin() + i + 1 + size);
+                    i += size + 2;
+                } else if (p.owner[0] == 'm') {
+                    auto mapping_keys = function.get_mapping_keys(p.name);
+                    res.push_back(old_states[i+1]);
+                    for (size_t j = 0; j < mapping_keys.size(); j++) {
+                        size_t pos = i + 2 + j * 3;
+                        auto pk = public_keys.at(old_states[pos + 2]);
+                        auto iv = to_bytes(old_states[pos + 1]);
+                        auto data = to_bytes(old_states[pos]);
+                        auto decrypted = Utils::decrypt_data(kp, pk, iv, data);
+                        res.push_back(to_hex_string(decrypted));
+                    }
+                    i += i + 2 + mapping_keys.size() * 3;
+                } else {
+                    auto pk = public_keys.at(old_states[i + 3]);
+                    auto iv = to_bytes(old_states[i + 2]);
+                    auto data = to_bytes(old_states[i + 1]);
+                    auto decrypted = Utils::decrypt_data(kp, pk, iv, data);
+                    res.push_back(to_hex_string(decrypted));
+                    i += 4;
+                }
+            }
+            return res;
+        }
+
+        void sync_result(const std::vector<std::string> &new_states, tls::KeyPairPtr kp, size_t nonce) {
+            // TODO: function selector
+            std::vector<uint8_t> data;
+            std::vector<void*> codes;
+            abicoder::paramCoder(codes, "set_states", "[]uint256", new_states);
+            auto packed = abicoder::pack(codes);
+            MessageCall mc;
+            mc.from = get_address_from_public_key_asn1(public_key_asn1(kp->get_raw_context()));
+            mc.to = verifierAddr;
+            mc.data = to_hex_string(packed);
+            auto bkp = std::dynamic_pointer_cast<tls::KeyPair_k1Bitcoin>(kp);
+            auto ethTx = sign_transaction(*bkp, EthereumTransaction(nonce, mc));
+            auto signed_data = ethTx.encode();
+            Utils::cloak_agent_log("set_states", to_hex_string(signed_data));
+        }
+
+        bool request_public_keys() {
+            std::vector<std::string> res;
+            for (size_t i = 0; i < old_states.size();) {
+                res.push_back(old_states[i]);
+                auto id = to_uint256(old_states[i]);
+                auto p = states.at(size_t(id));
+                int factor = 1;
+                if (p.owner[0] == '0') {
+                    // e.g. 0x1234223432344234
+                    if (old_states[i+3] == to_hex_string(tee_addr)) {
+                        res.push_back(p.owner);
+                    }
+                    factor = 3;
+                }
+                if (p.owner[0] == 'm') {
+                    // mapping
+                    auto keys = function.get_mapping_keys(p.name);
+                    res.insert(res.begin(), keys.begin(), keys.end());
+                    factor = 3;
+                }
+                if (p.type[0] == 'm' || p.type[0] == 'a') {
+                    i += i + 2 + to_uint64(old_states[i+1]) * factor;
+                } else {
+                    i += 1 + 1 * factor;
+                }
+                continue;
+            }
+            if (res.empty()) {
+                return false;
+            }
+            // TODO function selector
+            std::vector<uint8_t> data = to_bytes("FunctionSelector");
+            std::vector<void*> codes;
+            abicoder::paramCoder(codes, "read", "uint256[]", res);
+            auto params = abicoder::pack(codes);
+            data.insert(data.begin(), params.begin(), params.end());
+            nlohmann::json j;
+            j["tx_hash"] = to_hex_string(hash());
+            j["data"] = to_hex_string(data);
+            Utils::cloak_agent_log("request_public_keys", j.dump());
+            return true;
         }
 
     private:

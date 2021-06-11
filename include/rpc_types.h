@@ -207,7 +207,34 @@ static std::unordered_map<ByteData, int> contractType = {
           }
           return s;
       }
-      
+
+      std::vector<std::string> get_mapping_keys(const std::string& name) {
+          std::vector<std::string> res;
+          for (auto&& x : read) {
+              if (x.name == name) {
+                  for (auto&& key : x.keys) {
+                      for (auto&& input : inputs) {
+                          if (input.name == key) {
+                              res.push_back(input.value.value());
+                          }
+                      }
+                  }
+              }
+          }
+          for (auto&& x : mutate) {
+              if (x.name == name) {
+                  for (auto&& key : x.keys) {
+                      for (auto&& input : inputs) {
+                          if (input.name == key) {
+                              res.push_back(input.value.value());
+                          }
+                      }
+                  }
+              }
+          }
+          return res;
+      }
+
       private:
         size_t num = 0;
     };
@@ -313,6 +340,11 @@ static std::unordered_map<ByteData, int> contractType = {
     struct SendMultiPartyTransaction
     {
       ByteData params = {};
+    };
+
+    struct SyncOldStates {
+        eevm::KeccakHash mpt;
+        std::vector<std::string> old_states = {};
     };
 
     struct WorkOrderSubmit 
@@ -522,6 +554,16 @@ static std::unordered_map<ByteData, int> contractType = {
       RpcBuilder<SendMultiPartyTransactionTag, 
         rpcparams::SendMultiPartyTransaction, 
         rpcresults::MultiPartyReceiptResponse
+      >;
+
+    struct SyncOldStatesTag
+    {
+      static constexpr auto name = "cloak_syncOldStates";
+    };
+    using SyncOldStates = 
+      RpcBuilder<SyncOldStatesTag, 
+        rpcparams::SyncOldStates, 
+        ByteData
       >;
 
     struct WorkOrderSubmitTag

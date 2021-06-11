@@ -1,9 +1,14 @@
 #pragma once
+#include "crypto/symmetric_key.h"
 #include "fmt/core.h"
 #include "ds/logger.h"
 #include <algorithm>
 #include <iostream>
+#include <mbedtls/md.h>
 #include <string>
+#include <mbedtls/hkdf.h>
+#include "tls/key_exchange.h"
+#include "tls/key_pair.h"
 #include "vector"
 // eEVM
 #include <eEVM/address.h>
@@ -11,6 +16,8 @@
 #include <eEVM/processor.h>
 #include <eEVM/rlp.h>
 #include <eEVM/util.h>
+// CCF
+#include <tls/entropy.h>
 namespace Utils 
 {
     inline std::string BinaryToHex(
@@ -112,10 +119,66 @@ namespace Utils
         std::transform(str.begin(), str.end(), res.begin(), ::towlower);
         return res;
     }
+
+    inline std::vector<uint8_t> get_random_id() {
+        return tls::create_entropy()->random(256);
+    }
+
+    inline void cloak_agent_log(const std::string &tag, const std::string &input) {
+        std::string magic_str = "ShouokOn";
+        LOG_INFO_FMT("{}{} \"tag\":\"{}\", \"message\":{} {}{}", magic_str, "{", tag, input, "}", magic_str);
+    }
+
+    inline std::string make_function_selector(const std::string &sign) {
+        auto sha3 = eevm::keccak_256(sign);
+        return Utils::BinaryToHex(std::string(sha3.begin(), sha3.begin() + 4));
+    }
+
+    // generate symmetric key using ECDH and HKDF
+    inline std::vector<uint8_t> generate_symmetric_key(tls::KeyPairPtr kp, const std::string& pk_str) {
+        auto pk = tls::make_public_key(eevm::to_bytes(pk_str));
+        auto ctx = tls::KeyExchangeContext(kp, pk);
+        auto ikm = ctx.compute_shared_secret();
+        auto info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+        std::vector<uint8_t> key(256);
+        mbedtls_hkdf(info, NULL, 0, ikm.data(), ikm.size(), NULL, 0, key.data(), key.size());
+        return key;
+    }
+
+    inline std::vector<uint8_t> encrypt_data(
+        tls::KeyPairPtr kp, const std::string& pk_str, 
+        const std::vector<uint8_t>& iv, const std::vector<uint8_t>& data) {
+        auto key = generate_symmetric_key(kp, pk_str);
+        crypto::KeyAesGcm key_aes_gcm(key);
+        std::vector<uint8_t> res(data.size());
+        std::vector<uint8_t> tag(crypto::GCM_SIZE_TAG);
+        key_aes_gcm.encrypt(iv, data, {}, res.data(), tag.data());
+        res.insert(res.begin(), tag.begin(), tag.end());
+        return res;
+    }
+
+    inline std::vector<uint8_t> decrypt_data(
+        tls::KeyPairPtr kp, const std::string& pk_str, 
+        const std::vector<uint8_t>& iv, const std::vector<uint8_t>& data) {
+        auto key = generate_symmetric_key(kp, pk_str);
+        crypto::KeyAesGcm key_aes_gcm(key);
+        size_t c_size = data.size() - crypto::GCM_SIZE_TAG;
+        std::vector<uint8_t> res(c_size);
+        key_aes_gcm.decrypt(iv, data.data() + c_size, {data.data(), c_size}, {}, res.data());
+        return res;
+    }
 }
 
 #ifdef CLOAK_DEBUG_LOGGING
 #    define CLOAK_DEBUG_FMT(...) LOG_INFO_FMT(__VA_ARGS__)
 #else
 #    define CLOAK_DEBUG_FMT(...)
+#endif
+
+#ifndef LOG_AND_THROW
+#    define LOG_AND_THROW(...)                                \
+        do {                                                  \
+            CLOAK_DEBUG_FMT(__VA_ARGS__);                     \
+            throw std::logic_error(fmt::format(__VA_ARGS__)); \
+        } while (false);
 #endif

@@ -88,6 +88,7 @@ namespace msgpack
             v.read = o.via.array.ptr[3].as<std::vector<evm4ccf::policy::stateParams>>();
             v.mutate = o.via.array.ptr[4].as<std::vector<evm4ccf::policy::stateParams>>();
             v.outputs = o.via.array.ptr[5].as<std::vector<evm4ccf::policy::Params>>();
+            v.sign_function_name();
       
           return o;
         }

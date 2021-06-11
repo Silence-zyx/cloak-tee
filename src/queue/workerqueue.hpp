@@ -6,6 +6,7 @@
 #include "workertransaction.h"
 #include "unordered_map"
 #include "../app/tables.h"
+#include <vector>
 namespace evm4ccf
 {
     using h256 = eevm::KeccakHash;
@@ -14,8 +15,7 @@ namespace evm4ccf
     using Guard = std::lock_guard<std::mutex>;
     using RecursiveMutex = std::recursive_mutex;
     using RecursiveGuard = std::lock_guard<std::recursive_mutex>;
-
-    
+    using MptId = std::vector<uint8_t>;
     
 class WorkerQueue
 {

@@ -4,6 +4,7 @@
 
 // EVM-for-CCF
 #include "tables.h"
+#include "utils.h"
 
 // eEVM
 #include <eEVM/account.h>
@@ -72,12 +73,14 @@ namespace evm4ccf
     // SNIPPET_START: store_impl
     void store(const uint256_t& key, const uint256_t& value) override
     {
+      CLOAK_DEBUG_FMT("store key:{}, value:{}", key, value);
       storage.put(translate(key), value);
     }
     // SNIPPET_END: store_impl
 
     uint256_t load(const uint256_t& key) override
     {
+      CLOAK_DEBUG_FMT("load key:{}", key);
       return storage.get(translate(key)).value_or(0);
     }
 
