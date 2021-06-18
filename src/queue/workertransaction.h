@@ -6,6 +6,7 @@
 #include "iostream"
 #include "nlohmann/json.hpp"
 #include "string"
+#include "tls/entropy.h"
 #include "tls/key_pair.h"
 #include "vector"
 #include "../app/utils.h"
@@ -89,8 +90,7 @@ namespace evm4ccf
             eevm::to_big_endian(r, sig.raw.data());
             eevm::to_big_endian(s, s_begin);
             auto hash = keccak_256(eevm::rlp::encode(nonce, from, to, to_hex_string(data)));
-            auto pubk =
-                tls::PublicKey_k1Bitcoin::recover_key(sig, {hash.data(), hash.size()});
+            auto pubk = tls::PublicKey_k1Bitcoin::recover_key(sig, {hash.data(), hash.size()});
             auto sf = get_address_from_public_key_asn1(public_key_asn1(pubk.get_raw_context()));
             if (sf != from) {
                 CLOAK_DEBUG_FMT("sf:{}, from:{}", sf, from);
@@ -111,7 +111,7 @@ namespace evm4ccf
         Address             from;
         Address             to;
         Address             verifierAddr;
-        Address             tee_addr;
+        tls::KeyPairPtr     tee_kp;
         ByteData            codeHash;
         policy::Function    function;
         std::vector<std::string> old_states;
@@ -141,6 +141,10 @@ namespace evm4ccf
             return eevm::keccak_256(eevm::to_bytes(codeHash));
         }
 
+        Address tee_addr() const {
+            return get_address_from_public_key_asn1(public_key_asn1(tee_kp->get_raw_context()));
+        }
+
         void set_status(Status status) {
             this->status = status;
         }
@@ -152,54 +156,27 @@ namespace evm4ccf
 
         void request_old_state() {
             auto data = get_states_call_data();
-            std::string msg = fmt::format(
-                "{} \"from\":\"{}\", \"to\":\"{}\", \"data\":\"{}\", \"tx_hash\": \"{}\" {}",
-                "{",
-                to_hex_string(from),
-                to_hex_string(from),
-                to_hex_string(data),
-                to_hex_string(hash()),
-                "}");
-            Utils::cloak_agent_log("request_old_state", msg);
+            nlohmann::json j;
+            j["from"] = to_hex_string(tee_addr());
+            j["to"] = to_hex_string(verifierAddr);
+            j["data"] = to_hex_string(data);
+            j["tx_hash"] = to_hex_string(hash());
+            Utils::cloak_agent_log("request_old_state", j.dump());
         }
 
         std::vector<uint8_t> get_states_call_data() {
-            CLOAK_DEBUG_FMT("begin request old state");
             std::vector<std::string> param;
             for (size_t i = 0; i < states.size(); i++) {
                 auto state = states[i];
-                std::smatch match;
-                if (!std::regex_match(state.type, match, std::regex(patternMapping))) {
+                if (state.type[0] != 'm') {
                     continue;
                 }
                 param.push_back(to_hex_string(i));
-                for (auto&& read_param : function.read) {
-                    if (read_param.name == state.name) {
-                        param.push_back(to_hex_string(read_param.keys.size()));
-                        for (auto&& k : read_param.keys) {
-                            for (auto&& input : function.inputs) {
-                                if (input.name == k) {
-                                    param.push_back(input.value.value());
-                                }
-                            }
-                        }
-                    }
+                auto keys = function.get_mapping_keys(state.name);
+                param.push_back(to_hex_string(keys.size()));
+                for (auto&& k : keys) {
+                    param.push_back(k);
                 }
-                for (auto&& mutate_param : function.mutate) {
-                    if (mutate_param.name == state.name) {
-                        param.push_back(to_hex_string(mutate_param.keys.size()));
-                        for (auto&& k : mutate_param.keys) {
-                            for (auto&& input : function.inputs) {
-                                if (input.name == k) {
-                                    param.push_back(input.value.value());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            for (auto&& p : param) {
-                CLOAK_DEBUG_FMT("param:{}", p);
             }
             // function selector
             std::vector<uint8_t> data = to_bytes("0xecb60960");
@@ -212,19 +189,19 @@ namespace evm4ccf
             return data;
         }
 
-        std::vector<std::string> encrypt_states(const std::vector<std::string>& new_states, tls::KeyPairPtr kp) {
+        std::vector<std::string> encrypt_states(const std::vector<std::string>& new_states) {
             std::vector<std::string> res;
             for (size_t i = 0; i < new_states.size();) {
-                auto id = to_uint64(new_states[i]);
                 // policy state
-                auto ps = states[id];
+                auto ps = states[to_uint64(new_states[i])];
                 if (ps.owner == "all") {
                     res.insert(res.end(), {new_states[i], new_states[i+1]});
                     i += 2;
                 } else if (ps.owner[0] == '0') {
                     auto iv = tls::create_entropy()->random(crypto::GCM_SIZE_IV);
-                    auto decrypted = Utils::encrypt_data(kp, ps.owner, iv, to_bytes(new_states[i+1]));
-                    res.insert(res.end(), {new_states[i], to_hex_string(decrypted), to_hex_string(iv), ps.owner});
+                    auto&& [encrypted, tag] = Utils::encrypt_data_s(tee_kp, ps.owner, iv, to_bytes(new_states[i + 1]));
+                    tag.insert(tag.end(), iv.begin(), iv.end());
+                    res.insert(res.end(), {new_states[i], to_hex_string(encrypted), to_hex_string(tag), ps.owner});
                     i += 2;
 
                 } else if (ps.owner[0] == 'm') {
@@ -233,70 +210,82 @@ namespace evm4ccf
                     for (size_t j = 0; j < mapping_keys.size(); j++) {
                         size_t pos = i + 2 + j;
                         auto iv = tls::create_entropy()->random(crypto::GCM_SIZE_IV);
-                        auto decrypted = Utils::encrypt_data(kp, mapping_keys[j], iv, to_bytes(new_states[pos]));
-                        res.insert(res.end(), {to_hex_string(decrypted), to_hex_string(iv), mapping_keys[j]});
+                        auto&& [decrypted, tag] =
+                            Utils::encrypt_data_s(tee_kp, mapping_keys[j], iv, to_bytes(new_states[pos]));
+                        tag.insert(tag.end(), iv.begin(), iv.end());
+                        res.insert(res.end(), {to_hex_string(decrypted), to_hex_string(tag), mapping_keys[j]});
                     }
                     i += 2 + mapping_keys.size();
                 } else {
-                    LOG_AND_THROW("don't support owner:{}", ps.owner);
+                    LOG_AND_THROW("invalid owner:{}", ps.owner);
                 }
             }
             return res;
         }
 
-        std::vector<std::string> decrypt_states(const std::map<std::string, std::string>& public_keys, tls::KeyPairPtr kp) {
+        std::vector<std::string> decrypt_states(const std::map<std::string, std::string>& public_keys) {
             std::vector<std::string> res;
             for (size_t i = 0; i < old_states.size();) {
                 res.push_back(old_states[i]);
-                auto id = to_uint256(old_states[i]);
-                auto p = states.at(size_t(id));
+                auto p = states.at(to_uint64(old_states[i]));
                 if (p.owner == "all") {
-                    if (p.type[0] != 'm' && p.type[0] != 'a') {
+                    if (p.type[0] == 'm') {
+                        auto size = size_t(to_uint256(old_states[i + 1]));
+                        res.insert(res.begin(), old_states.begin() + i + 1, old_states.begin() + i + 1 + size);
+                        i += size + 2;
+                    } else {
                         res.push_back(old_states[i + 1]);
                         i += 2;
-                        continue;
                     }
-                    auto size = size_t(to_uint256(old_states[i + 1]));
-                    res.insert(res.begin(), old_states.begin() + i + 1, old_states.begin() + i + 1 + size);
-                    i += size + 2;
                 } else if (p.owner[0] == 'm') {
                     auto mapping_keys = function.get_mapping_keys(p.name);
-                    res.push_back(old_states[i+1]);
+                    res.push_back(old_states[i + 1]);
                     for (size_t j = 0; j < mapping_keys.size(); j++) {
                         size_t pos = i + 2 + j * 3;
                         auto pk = public_keys.at(old_states[pos + 2]);
-                        auto iv = to_bytes(old_states[pos + 1]);
+                        // tag and iv
+                        auto ti = to_bytes(old_states[pos + 1]);
                         auto data = to_bytes(old_states[pos]);
-                        auto decrypted = Utils::decrypt_data(kp, pk, iv, data);
-                        res.push_back(to_hex_string(decrypted));
+                        data.insert(data.end(), ti.begin(), ti.begin() + crypto::GCM_SIZE_TAG);
+                        auto decrypted =
+                            Utils::decrypt_data(tee_kp, pk, {ti.begin() + crypto::GCM_SIZE_TAG, ti.end()}, data);
+                        res.insert(res.end(), {mapping_keys[i], to_hex_string(decrypted)});
                     }
                     i += i + 2 + mapping_keys.size() * 3;
-                } else {
+                } else if (p.owner[0] == '0') {
                     auto pk = public_keys.at(old_states[i + 3]);
-                    auto iv = to_bytes(old_states[i + 2]);
+                    // tag and iv
+                    auto ti = to_bytes(old_states[i + 2]);
                     auto data = to_bytes(old_states[i + 1]);
-                    auto decrypted = Utils::decrypt_data(kp, pk, iv, data);
+                    data.insert(data.end(), ti.begin(), ti.begin() + crypto::GCM_SIZE_TAG);
+                    auto decrypted =
+                        Utils::decrypt_data(tee_kp, pk, {ti.begin() + crypto::GCM_SIZE_TAG, ti.end()}, data);
                     res.push_back(to_hex_string(decrypted));
                     i += 4;
+                } else {
+                    LOG_AND_THROW("invalid owner:{}", p.owner);
                 }
             }
             return res;
         }
 
-        void sync_result(const std::vector<std::string> &new_states, tls::KeyPairPtr kp, size_t nonce) {
+        void sync_result(const std::vector<std::string>& new_states, size_t nonce) {
             // TODO: function selector
             std::vector<uint8_t> data;
             std::vector<void*> codes;
             abicoder::paramCoder(codes, "set_states", "[]uint256", new_states);
             auto packed = abicoder::pack(codes);
             MessageCall mc;
-            mc.from = get_address_from_public_key_asn1(public_key_asn1(kp->get_raw_context()));
+            mc.from = get_address_from_public_key_asn1(public_key_asn1(tee_kp->get_raw_context()));
             mc.to = verifierAddr;
             mc.data = to_hex_string(packed);
-            auto bkp = std::dynamic_pointer_cast<tls::KeyPair_k1Bitcoin>(kp);
+            auto bkp = std::dynamic_pointer_cast<tls::KeyPair_k1Bitcoin>(tee_kp);
             auto ethTx = sign_transaction(*bkp, EthereumTransaction(nonce, mc));
             auto signed_data = ethTx.encode();
-            Utils::cloak_agent_log("set_states", to_hex_string(signed_data));
+            nlohmann::json j;
+            j["tx_hash"] = to_hex_string(hash());
+            j["data"] = to_hex_string(signed_data);
+            Utils::cloak_agent_log("sync_result", j.dump());
         }
 
         bool request_public_keys() {
@@ -308,7 +297,7 @@ namespace evm4ccf
                 int factor = 1;
                 if (p.owner[0] == '0') {
                     // e.g. 0x1234223432344234
-                    if (old_states[i+3] == to_hex_string(tee_addr)) {
+                    if (old_states[i+3] == to_hex_string(tee_addr())) {
                         res.push_back(p.owner);
                     }
                     factor = 3;
@@ -316,10 +305,12 @@ namespace evm4ccf
                 if (p.owner[0] == 'm') {
                     // mapping
                     auto keys = function.get_mapping_keys(p.name);
+                    res.push_back(to_hex_string(keys.size()));
                     res.insert(res.begin(), keys.begin(), keys.end());
                     factor = 3;
                 }
-                if (p.type[0] == 'm' || p.type[0] == 'a') {
+                // TODO array
+                if (p.type[0] == 'm') {
                     i += i + 2 + to_uint64(old_states[i+1]) * factor;
                 } else {
                     i += 1 + 1 * factor;
@@ -338,6 +329,7 @@ namespace evm4ccf
             nlohmann::json j;
             j["tx_hash"] = to_hex_string(hash());
             j["data"] = to_hex_string(data);
+            // TODO: j["to"] = "";
             Utils::cloak_agent_log("request_public_keys", j.dump());
             return true;
         }
@@ -372,7 +364,7 @@ namespace evm4ccf
             tc.from = from;
             tc.to = to;
             tc.verifierAddr = verifierAddr;
-            tc.codeHash = codeHash;
+            tc.codeHash = to_hex_string(tls::create_entropy()->random64());
             tc.states = policy.states;
             tc.function = policy.get_funtions(name);
         }

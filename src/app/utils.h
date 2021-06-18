@@ -157,6 +157,17 @@ namespace Utils
         return res;
     }
 
+    using Bytes = std::vector<uint8_t>;
+    inline std::pair<Bytes, Bytes> encrypt_data_s(
+        tls::KeyPairPtr kp,
+        const std::string& pk_str,
+        const std::vector<uint8_t>& iv,
+        const std::vector<uint8_t>& data) {
+        Bytes encrypted = encrypt_data(kp, pk_str, iv, data);
+        size_t size = encrypted.size() - crypto::GCM_SIZE_TAG;
+        return {{encrypted.begin(), encrypted.begin() + size}, {encrypted.begin() + size, encrypted.end()}};
+    }
+
     inline std::vector<uint8_t> decrypt_data(
         tls::KeyPairPtr kp, const std::string& pk_str, 
         const std::vector<uint8_t>& iv, const std::vector<uint8_t>& data) {

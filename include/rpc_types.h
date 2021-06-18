@@ -342,11 +342,6 @@ static std::unordered_map<ByteData, int> contractType = {
       ByteData params = {};
     };
 
-    struct SyncOldStates {
-        eevm::KeccakHash mpt;
-        std::vector<std::string> old_states = {};
-    };
-
     struct WorkOrderSubmit 
     {
       WorkOrder workOrder = {};
@@ -554,16 +549,6 @@ static std::unordered_map<ByteData, int> contractType = {
       RpcBuilder<SendMultiPartyTransactionTag, 
         rpcparams::SendMultiPartyTransaction, 
         rpcresults::MultiPartyReceiptResponse
-      >;
-
-    struct SyncOldStatesTag
-    {
-      static constexpr auto name = "cloak_syncOldStates";
-    };
-    using SyncOldStates = 
-      RpcBuilder<SyncOldStatesTag, 
-        rpcparams::SyncOldStates, 
-        ByteData
       >;
 
     struct WorkOrderSubmitTag

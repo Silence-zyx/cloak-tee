@@ -322,30 +322,10 @@ namespace evm4ccf
         args.rpc_ctx->set_response_body(
           jsonrpc::result_response(0, eevm::to_hex_string(result)).dump());
 
-        // run in evm
-        auto ct = workerQueue.GetCloakTransaction(result);
-        if (ct.has_value() && ct.value()->function.complete())
-        {
-          CloakTransaction *ct_value = ct.value();
-          ct_value->request_old_state();
-          CLOAK_DEBUG_FMT("ct function: {}\n", ct_value->function.info());
-          ct_value->set_status(PACKAGE);
-          auto data = ct_value->function.packed_to_data();
-          MessageCall mc;
-          mc.from = mpt.from;
-          mc.to = mpt.to;
-          mc.data = to_hex_string(data);
-          CLOAK_DEBUG_FMT("ct function data: {}", mc.data);
-          auto es = make_state(args.tx);
-
-          const auto res = run_in_evm(mc, es).first;
-          CLOAK_DEBUG_FMT("run in evm, res: {}, msg: {}\n", res.output, res.exmsg);
-          if (res.er == ExitReason::threw) {
-              ct_value->set_status(FAILED);
-          } else {
-              ct_value->set_status(SUCCEEDED);
-          }
-          // TODO: handle return result
+        auto ct = workerQueue.GetCloakTransaction(result).value();
+        ct->tee_kp = tee_kp;
+        if (ct->function.complete()) {
+            ct->request_old_state();
         }
 
         return ccf::make_success("");
@@ -440,36 +420,35 @@ namespace evm4ccf
             account_state.acc.get_nonce()});
         };
 
-      auto sync_old_states = [this](ccf::EndpointContext& args) {
-          const auto body_j = nlohmann::json::parse(args.rpc_ctx->get_request_body());
-          auto sos = body_j.get<rpcparams::SyncOldStates>();
+      auto sync_old_states = [this](kv::Tx& tx, const nlohmann::json& params) {
+          auto old_states = decode_uint256_array(to_bytes(params["data"].get<std::string>()));
+          h256 tx_hash = Utils::to_KeccakHash(params["tx_hash"].get<std::string>());
           std::vector<void*> codes;
-          abicoder::paramCoder(codes, "read", "uint256[]", sos.old_states);
+          abicoder::paramCoder(codes, "read", "uint256[]", old_states);
           auto old_states_packed = abicoder::pack(codes);
           auto old_states_hash = eevm::keccak_256(old_states_packed);
 
-          auto ct_opt = workerQueue.GetCloakTransaction(sos.mpt);
+          auto ct_opt = workerQueue.GetCloakTransaction(tx_hash);
           if (!ct_opt.has_value()) {
               // TODO
-              return;
+              return false;
           }
           auto ct = ct_opt.value();
           if (!ct->function.complete()) {
               // TODO
+              return false;
           }
-          ct->old_states = sos.old_states;
+          ct->old_states = old_states;
           ct->old_states_hash = old_states_hash;
           if (ct->request_public_keys()) {
-              // TODO
-              return;
+              return true;
           }
-          execute_mpt(workerQueue, ct->old_states, sos.mpt, args.tx, tee_kp, nonce);
+          execute_mpt(workerQueue, ct->old_states, tx_hash, tx, nonce);
+          return true;
       };
     
       auto sync_public_keys = [this](kv::Tx& tx, const nlohmann::json& params) {
-          auto tx_hash_vec = to_bytes(params["tx_hash"].get<std::string>());
-          h256 tx_hash;
-          std::copy(tx_hash_vec.begin(), tx_hash_vec.end(), tx_hash.begin());
+          auto tx_hash = Utils::to_KeccakHash(params["tx_hash"].get<std::string>());
           auto ct_opt = workerQueue.GetCloakTransaction(tx_hash);
           if (!ct_opt.has_value()) {
               // TODO
@@ -477,12 +456,13 @@ namespace evm4ccf
           }
           auto ct = ct_opt.value();
           std::map<std::string, std::string> public_keys;
-          auto public_key_list = params["public_keys"].get<std::vector<std::string>>();
+          auto public_keys_str = params["data"].get<std::string>();
+          auto public_key_list = decode_uint256_array(to_bytes(public_keys_str));
           for (size_t i = 0; i < public_key_list.size(); i++) {
               public_keys.insert(std::make_pair(public_key_list[i], public_key_list[i+1]));
           }
-          std::vector<std::string> decrypted = ct->decrypt_states(public_keys, tee_kp);
-          execute_mpt(workerQueue, decrypted, tx_hash, tx, tee_kp, nonce);
+          std::vector<std::string> decrypted = ct->decrypt_states(public_keys);
+          execute_mpt(workerQueue, decrypted, tx_hash, tx, nonce);
           // TODO response
           return true;
       };
@@ -533,9 +513,9 @@ namespace evm4ccf
         .install();
 
       make_endpoint(
-        ethrpc::SyncOldStates::name,
+        "eth_sync_old_states",
         HTTP_POST,
-        sync_old_states)
+        ccf::json_adapter(sync_old_states))
         .install();
 
       make_endpoint(
@@ -680,7 +660,6 @@ namespace evm4ccf
         const std::vector<std::string>& decryped_states,
         h256 tx_hash,
         kv::Tx& tx,
-        tls::KeyPairPtr kp,
         size_t nonce) {
         auto ct_opt = workerQueue.GetCloakTransaction(tx_hash);
         if (!ct_opt.has_value()) {
@@ -696,8 +675,7 @@ namespace evm4ccf
         auto set_states_call_data = eevm::to_bytes("");
         set_states_call_data.insert(
             set_states_call_data.begin(), decryped_states_packed.begin(), decryped_states_packed.end());
-        // TODO: from
-        // set_states_mc.from =
+        set_states_mc.from = ct->tee_addr();
         set_states_mc.to = ct->to;
         set_states_mc.data = eevm::to_hex_string(set_states_call_data);
         auto set_states_es = make_state(tx);
@@ -729,7 +707,7 @@ namespace evm4ccf
         auto get_new_states_call_data = ct->get_states_call_data();
         codes.clear();
         // TODO: from
-        // set_states_mc.from =
+        set_states_mc.from = ct->tee_addr();
         set_states_mc.to = ct->to;
         set_states_mc.data = eevm::to_hex_string(get_new_states_call_data);
         auto get_new_states_es = make_state(tx);
@@ -739,21 +717,23 @@ namespace evm4ccf
             return;
         }
 
-        // decode result
-        std::vector<uint8_t> output = get_new_states_res.output;
-        std::vector<uint8_t> count_vec(output.begin()+32, output.begin()+64);
-        std::vector<std::string> new_states;
+        // == Sync new states ==
+        std::vector<std::string> new_states = decode_uint256_array(get_new_states_res.output);
+        auto encrypted = ct->encrypt_states(new_states);
+        ct->sync_result(encrypted, nonce);
+        // TODO response
+    }
+
+    static std::vector<std::string> decode_uint256_array(const std::vector<uint8_t>& states) {
+        std::vector<uint8_t> count_vec(states.begin() + 32, states.begin() + 64);
+        std::vector<std::string> res;
         size_t count = to_uint64(to_hex_string(count_vec));
         for (size_t i = 0; i < count; i++) {
-            auto it = output.begin()+64+i*256;
+            auto it = states.begin() + 64 + i * 256;
             std::vector<uint8_t> state(it, it+256);
-            new_states.push_back(to_hex_string(state));
+            res.push_back(to_hex_string(state));
         }
-
-        // == Sync new states ==
-        auto encrypted = ct->encrypt_states(new_states, kp);
-        ct->sync_result(encrypted, kp, nonce);
-        // TODO response
+        return res;
     }
 
     static std::tuple<ExecResult, TxHash, Address> execute_transaction(

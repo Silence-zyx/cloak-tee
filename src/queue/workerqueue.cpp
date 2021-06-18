@@ -93,6 +93,7 @@ std::optional<CloakTransaction*> WorkerQueue::GetCloakTransaction(const h256 &ha
     if (auto it = workerQueue.find(hash); it != workerQueue.end()) {
         return &it->second;
     }
+    CLOAK_DEBUG_FMT("tx_hash:{} not found", hash);
     return {};
 }
 

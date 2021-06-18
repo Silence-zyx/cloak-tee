@@ -406,15 +406,6 @@ namespace evm4ccf
       from_to_str(j, "params", s.params);
     }
 
-    inline void from_json(const nlohmann::json& j, SyncOldStates& s) {
-        require_array(j);
-        std::copy(j[0].begin(), j[0].end(), s.mpt.begin());
-        std::copy(j[1].begin(), j[1].end(), s.old_states.begin());
-        // s.old_states = j[1];
-    }
-
-    inline void to_json(nlohmann::json& j, const SyncOldStates& s) {}
-    
     //
     inline void to_json(nlohmann::json& j, const SendRawTransaction& s)
     {
