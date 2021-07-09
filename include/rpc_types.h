@@ -335,6 +335,7 @@ static std::unordered_map<ByteData, int> contractType = {
       ByteData codeHash = {};
       eevm::Address verifierAddr = {};
       ByteData policy = {};
+      eevm::Address pkiAddr = {};
     };
 
     struct SendMultiPartyTransaction

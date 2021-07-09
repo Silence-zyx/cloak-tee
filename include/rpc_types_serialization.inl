@@ -428,6 +428,7 @@ namespace evm4ccf
       j["codeHash"] = s.codeHash;
       j["verifierAddr"] = eevm::to_checksum_address(s.verifierAddr);
       j["policy"] = s.policy;
+      j["pkiAddr"] = s.pkiAddr;
     }
 
     inline void from_json(const nlohmann::json& j, SendPrivacyPolicy& s)
@@ -439,6 +440,7 @@ namespace evm4ccf
       from_to_str(j, "codeHash", s.codeHash);
       from_to_str(j, "policy", s.policy);
       s.verifierAddr = eevm::to_uint256(j["verifierAddr"]);
+      s.pkiAddr = eevm::to_uint256(j["pkiAddr"]);
     }
   } // namespace rpcparams
 

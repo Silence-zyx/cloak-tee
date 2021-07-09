@@ -329,4 +329,15 @@ namespace evm4ccf
     const auto signature = kp.sign_recoverable_hashed({tbs.data(), tbs.size()});
     return EthereumTransactionWithSignature(tx, signature);
   }
+
+  inline eevm::Address get_addr_from_kp(tls::KeyPairPtr kp) {
+      return get_address_from_public_key_asn1(public_key_asn1(kp->get_raw_context()));
+  }
+
+  inline std::vector<uint8_t> sign_eth_tx(tls::KeyPairPtr kp, const rpcparams::MessageCall& mc, size_t nonce) {
+      auto bkp = std::dynamic_pointer_cast<tls::KeyPair_k1Bitcoin>(kp);
+      CLOAK_DEBUG_FMT("bkp:{}", bkp);
+      auto ethTx = sign_transaction(*bkp, evm4ccf::EthereumTransaction(nonce, mc));
+      return ethTx.encode();
+  }
 } // namespace evm4ccf

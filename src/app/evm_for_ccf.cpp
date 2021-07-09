@@ -48,7 +48,6 @@ namespace evm4ccf
     tables::Accounts accounts;
     tables::Storage storage;
     tables::Results tx_results;
-    Address tee_addr;
     tls::KeyPairPtr tee_kp;
     size_t nonce = 0;
     WorkerQueue workerQueue;
@@ -328,7 +327,7 @@ namespace evm4ccf
             ct->request_old_state();
         }
 
-        return ccf::make_success("");
+        return ccf::make_success("ok");
       };
 
       auto get_multiPartyStatus = [this](ccf::EndpointContext& args) {
@@ -424,7 +423,7 @@ namespace evm4ccf
           auto old_states = decode_uint256_array(to_bytes(params["data"].get<std::string>()));
           h256 tx_hash = Utils::to_KeccakHash(params["tx_hash"].get<std::string>());
           std::vector<void*> codes;
-          abicoder::paramCoder(codes, "read", "uint256[]", old_states);
+          abicoder::paramCoder(codes, "oldStates", "uint256[]", old_states);
           auto old_states_packed = abicoder::pack(codes);
           auto old_states_hash = eevm::keccak_256(old_states_packed);
 
@@ -464,6 +463,19 @@ namespace evm4ccf
           std::vector<std::string> decrypted = ct->decrypt_states(public_keys);
           execute_mpt(workerQueue, decrypted, tx_hash, tx, nonce);
           // TODO response
+          return true;
+      };
+
+      auto prepare = [this](kv::Tx&, const nlohmann::json& params) {
+          Address cloak_service_addr = to_uint256(params["cloak_service_addr"].get<std::string>());
+          CLOAK_DEBUG_FMT("cloak_service_addr:{}", to_hex_string(cloak_service_addr));
+          std::vector<uint8_t> data = Utils::make_function_selector("setTEEAddress()");
+          MessageCall mc;
+          mc.from = get_addr_from_kp(tee_kp);
+          mc.to = cloak_service_addr;
+          mc.data = to_hex_string(data);
+          auto signed_data = sign_eth_tx(tee_kp, mc, nonce);
+          Utils::cloak_agent_log("register_tee_addr", to_hex_string(signed_data));
           return true;
       };
 
@@ -530,6 +542,8 @@ namespace evm4ccf
         HTTP_POST,
         ccf::json_adapter(sync_public_keys))
         .install();
+
+      make_endpoint("cloak_prepare", HTTP_POST, ccf::json_adapter(prepare)).install();
     }
 
   public:
@@ -544,7 +558,7 @@ namespace evm4ccf
       },
       storage("eth.storage"),
       tx_results("eth.txresults"),
-      tee_kp(tls::make_key_pair()),
+      tee_kp(tls::make_key_pair(tls::CurveImpl::secp256k1_bitcoin)),
       workerQueue(*nwt.tables)
     // SNIPPET_END: initialization
     {
@@ -655,12 +669,8 @@ namespace evm4ccf
       // }
     }
 
-    void execute_mpt(
-        WorkerQueue& workerQueue,
-        const std::vector<std::string>& decryped_states,
-        h256 tx_hash,
-        kv::Tx& tx,
-        size_t nonce) {
+    void execute_mpt(WorkerQueue& workerQueue, const std::vector<std::string>& decryped_states,
+                     h256 tx_hash, kv::Tx& tx, size_t nonce) {
         auto ct_opt = workerQueue.GetCloakTransaction(tx_hash);
         if (!ct_opt.has_value()) {
             // TODO
@@ -671,8 +681,8 @@ namespace evm4ccf
         std::vector<void*> codes;
         abicoder::paramCoder(codes, "set_states", "uint256[]", decryped_states);
         auto decryped_states_packed = abicoder::pack(codes);
-        // TODO: function selector
-        auto set_states_call_data = eevm::to_bytes("");
+        // function selector
+        auto set_states_call_data = eevm::to_bytes("a30e2625");
         set_states_call_data.insert(
             set_states_call_data.begin(), decryped_states_packed.begin(), decryped_states_packed.end());
         set_states_mc.from = ct->tee_addr();
@@ -704,9 +714,8 @@ namespace evm4ccf
 
         // == get new states ==
         MessageCall get_new_states_mc;
-        auto get_new_states_call_data = ct->get_states_call_data();
+        auto get_new_states_call_data = ct->get_states_call_data(true);
         codes.clear();
-        // TODO: from
         set_states_mc.from = ct->tee_addr();
         set_states_mc.to = ct->to;
         set_states_mc.data = eevm::to_hex_string(get_new_states_call_data);

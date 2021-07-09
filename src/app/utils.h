@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <iostream>
 #include <mbedtls/md.h>
+#include <stdint.h>
 #include <string>
 #include <mbedtls/hkdf.h>
+#include "nlohmann/json.hpp"
 #include "tls/key_exchange.h"
 #include "tls/key_pair.h"
 #include "vector"
@@ -124,14 +126,17 @@ namespace Utils
         return tls::create_entropy()->random(256);
     }
 
-    inline void cloak_agent_log(const std::string &tag, const std::string &input) {
+    inline void cloak_agent_log(const std::string &tag, const nlohmann::json &msg) {
         std::string magic_str = "ShouokOn";
-        LOG_INFO_FMT("{}{} \"tag\":\"{}\", \"message\":{} {}{}", magic_str, "{", tag, input, "}", magic_str);
+        nlohmann::json j;
+        j["tag"] = tag;
+        j["message"] = msg;
+        LOG_INFO_FMT("{}{}{}", magic_str, j.dump(), magic_str);
     }
 
-    inline std::string make_function_selector(const std::string &sign) {
+    inline std::vector<uint8_t> make_function_selector(const std::string& sign) {
         auto sha3 = eevm::keccak_256(sign);
-        return Utils::BinaryToHex(std::string(sha3.begin(), sha3.begin() + 4));
+        return {sha3.begin(), sha3.begin() + 4};
     }
 
     // generate symmetric key using ECDH and HKDF
