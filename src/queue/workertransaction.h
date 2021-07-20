@@ -2,6 +2,7 @@
 #include "crypto/symmetric_key.h"
 #include "ds/logger.h"
 #include "fmt/core.h"
+#include "fmt/format.h"
 #include "fmt/locale.h"
 #include "iostream"
 #include "nlohmann/json.hpp"
@@ -146,16 +147,22 @@ namespace evm4ccf
         }
 
         Address tee_addr() const {
-            return get_address_from_public_key_asn1(public_key_asn1(tee_kp->get_raw_context()));
+            return get_addr_from_kp(tee_kp);
+        }
+
+        std::vector<uint8_t> tee_addr_32_bytes() const {
+            auto addr = get_addr_from_kp(tee_kp);
+            auto res = to_bytes(address_to_hex_string(addr));
+            res.resize(32, 0);
+            return res;
+        }
+
+        std::vector<uint8_t> tee_public_key() {
+            return public_key_asn1(tee_kp->get_raw_context());
         }
 
         void set_status(Status status) {
             this->status = status;
-        }
-
-        std::string make_var_function_selector(const std::string& name) {
-            auto sha3 = eevm::keccak_256(name+"()");
-            return Utils::BinaryToHex(std::string(sha3.begin(), sha3.begin() + 4));
         }
 
         void request_old_state() {
@@ -182,6 +189,7 @@ namespace evm4ccf
                     read.push_back(k);
                 }
             }
+            CLOAK_DEBUG_FMT("read:{}", fmt::join(read, ", "));
             return read;
         }
 
@@ -195,17 +203,18 @@ namespace evm4ccf
                     res += encrypted && state.owner != "all" ? 2 + 4 * keys.size() : 2 + 2 * keys.size();
                 }
             }
+            CLOAK_DEBUG_FMT("return_len:{}", res);
             return res;
         }
 
         std::vector<uint8_t> get_states_call_data(bool encrypted) {
             std::vector<std::string> read = get_states_read();
             size_t return_len = get_states_return_len(encrypted);
-            CLOAK_DEBUG_FMT("get_states_call_data, return_len:{}", return_len);
+            CLOAK_DEBUG_FMT("get_states_call_data, return_len:{}, read:{}", return_len, fmt::join(read, ", "));
             // function selector
-            std::vector<uint8_t> data = to_bytes("e27d92b8");
+            std::vector<uint8_t> data = Utils::make_function_selector("get_states(uint256[],uint256)");
             std::vector<void*> codes;
-            abicoder::paramCoder(codes, "read", "uint256[]", read);
+            abicoder::paramCoder(codes, "read", "uint[]", read);
             abicoder::paramCoder(codes, "return_len", "uint", to_hex_string(return_len));
             auto packed = abicoder::pack(codes);
             data.insert(data.end(), packed.begin(), packed.end());
@@ -216,17 +225,19 @@ namespace evm4ccf
             std::vector<std::string> res;
             for (size_t i = 0; i < new_states.size();) {
                 // policy state
+                auto tee_addr_hex = to_hex_string(tee_addr_32_bytes());
+                auto tee_pk_pem = tee_kp->public_key_pem();
                 auto ps = states[to_uint64(new_states[i])];
                 if (ps.owner == "all") {
                     res.insert(res.end(), {new_states[i], new_states[i+1]});
                     i += 2;
-                } else if (ps.owner[0] == '0') {
+                } else if (ps.owner == "tee") {
                     auto iv = tls::create_entropy()->random(crypto::GCM_SIZE_IV);
-                    auto&& [encrypted, tag] = Utils::encrypt_data_s(tee_kp, ps.owner, iv, to_bytes(new_states[i + 1]));
+                    auto&& [encrypted, tag] = Utils::encrypt_data_s(tee_kp, tee_pk_pem, iv, to_bytes(new_states[i + 1]));
                     tag.insert(tag.end(), iv.begin(), iv.end());
-                    res.insert(res.end(), {new_states[i], to_hex_string(encrypted), to_hex_string(tag), ps.owner});
+                    tag.resize(32, 0);
+                    res.insert(res.end(), {new_states[i], to_hex_string(encrypted), to_hex_string(tag), tee_addr_hex});
                     i += 2;
-
                 } else if (ps.owner[0] == 'm') {
                     auto mapping_keys = function.get_mapping_keys(ps.name);
                     res.insert(res.end(), {new_states[i], new_states[i+1]});
@@ -234,9 +245,9 @@ namespace evm4ccf
                         size_t pos = i + 2 + j;
                         auto iv = tls::create_entropy()->random(crypto::GCM_SIZE_IV);
                         auto&& [decrypted, tag] =
-                            Utils::encrypt_data_s(tee_kp, mapping_keys[j], iv, to_bytes(new_states[pos]));
+                            Utils::encrypt_data_s(tee_kp, tls::Pem(mapping_keys[j]), iv, to_bytes(new_states[pos]));
                         tag.insert(tag.end(), iv.begin(), iv.end());
-                        res.insert(res.end(), {to_hex_string(decrypted), to_hex_string(tag), mapping_keys[j]});
+                        res.insert(res.end(), {to_hex_string(decrypted), to_hex_string(tag), tee_addr_hex});
                     }
                     i += 2 + mapping_keys.size();
                 } else {
@@ -276,16 +287,18 @@ namespace evm4ccf
                     }
                     i += i + 2 + mapping_keys.size() * 3;
                 } else if (p.owner == "tee") {
-                    auto pk = public_keys.at(old_states[i + 3]);
-                    if (to_uint256(pk) == 0) {
+                    auto sender_addr = old_states[i + 3];
+                    CLOAK_DEBUG_FMT("sender_addr:{}", sender_addr);
+                    if (to_uint256(sender_addr) == 0) {
                         res.push_back(to_hex_string(0));
                     } else {
                         // tag and iv
-                        auto ti = to_bytes(old_states[i + 2]);
+                        auto pk = tee_kp->public_key_pem();
+                        auto &&[tag, iv] = Utils::split_tag_and_iv(to_bytes(old_states[i + 2]));
+                        CLOAK_DEBUG_FMT("tag:{}, iv:{}", tag, iv);
                         auto data = to_bytes(old_states[i + 1]);
-                        data.insert(data.end(), ti.begin(), ti.begin() + crypto::GCM_SIZE_TAG);
-                        auto decrypted =
-                            Utils::decrypt_data(tee_kp, pk, {ti.begin() + crypto::GCM_SIZE_TAG, ti.end()}, data);
+                        data.insert(data.end(), tag.begin(), tag.end());
+                        auto decrypted = Utils::decrypt_data(tee_kp, pk, iv, data);
                         res.push_back(to_hex_string(decrypted));
                     }
                     i += 4;
@@ -293,26 +306,30 @@ namespace evm4ccf
                     LOG_AND_THROW("invalid owner:{}", p.owner);
                 }
             }
+            CLOAK_DEBUG_FMT("old_states:{}, res:{}", fmt::join(old_states, ", "), fmt::join(res, ", "));
             return res;
         }
 
         void sync_result(const std::vector<std::string>& new_states, size_t nonce) {
             // function selector
-            std::vector<uint8_t> data = to_bytes("0xb6994c20");
+            std::vector<uint8_t> data = Utils::make_function_selector("set_states(uint256[],uint256,uint256[],uint256[])");
             size_t old_states_len = get_states_return_len(true);
+            CLOAK_DEBUG_FMT("old_states_hash:{}", to_hex_string(old_states_hash));
             std::vector<void*> codes;
-            abicoder::paramCoder(codes, "read", "uint256[]", get_states_read());
+            abicoder::paramCoder(codes, "read", "uint[]", get_states_read());
             abicoder::paramCoder(codes, "old_states_len", "uint", to_hex_string(old_states_len));
-            abicoder::paramCoder(codes, "data", "uint256[]", new_states);
-            abicoder::paramCoder(codes, "proof", "uint[3]", get_proof());
+            abicoder::paramCoder(codes, "data", "uint[]", new_states);
+            abicoder::paramCoder(codes, "proof", "uint[]", get_proof());
             auto packed = abicoder::pack(codes);
+            data.insert(data.end(), packed.begin(), packed.end());
             MessageCall mc;
             mc.from = get_addr_from_kp(tee_kp);
             mc.to = verifierAddr;
-            mc.data = to_hex_string(packed);
-            auto bkp = std::dynamic_pointer_cast<tls::KeyPair_k1Bitcoin>(tee_kp);
-            auto ethTx = sign_transaction(*bkp, EthereumTransaction(nonce, mc));
-            auto signed_data = ethTx.encode();
+            mc.data = to_hex_string(data);
+            // TODO: choose a better value based on concrete contract
+            mc.gas = 0x34abf;
+            CLOAK_DEBUG_FMT("data:{}", mc.data);
+            auto signed_data = sign_eth_tx(tee_kp, mc, nonce);
             nlohmann::json j;
             j["tx_hash"] = to_hex_string(hash());
             j["data"] = to_hex_string(signed_data);
@@ -320,33 +337,30 @@ namespace evm4ccf
         }
 
         std::vector<std::string> get_proof() {
-            return {to_hex_string(hash()), to_hex_string(policy_hash), to_hex_string(old_states_hash)};
+            CLOAK_DEBUG_FMT("ch:{}, ph:{}, oh:{}", codeHash, to_hex_string(policy_hash), to_hex_string(old_states_hash));
+            return {codeHash, to_hex_string(policy_hash), to_hex_string(old_states_hash)};
         }
 
         bool request_public_keys() {
             std::vector<std::string> res;
-            bool uninitialized = false;
+            bool included_tee = false;
             for (size_t i = 0; i < old_states.size();) {
-                res.push_back(old_states[i]);
                 auto id = to_uint256(old_states[i]);
                 auto p = states.at(size_t(id));
                 int factor = 1;
+                CLOAK_DEBUG_FMT("p.info{}", p.info());
+                CLOAK_DEBUG_FMT("old_states[i+3]:{}", to_uint256(old_states[i+3]));
                 if (p.owner == "tee") {
-                    if (to_uint256(old_states[i+3]) != 0) {
-                        res.push_back(p.owner);
-                    } else {
-                        uninitialized = true;
-                    }
+                    included_tee = true;
                     factor = 3;
                 }
                 if (p.owner[0] == 'm') {
                     // mapping
                     auto keys = function.get_mapping_keys(p.name);
-                    res.push_back(to_hex_string(keys.size()));
-                    res.insert(res.begin(), keys.begin(), keys.end());
+                    res.insert(res.end(), {old_states[i], to_hex_string(keys.size())});
+                    res.insert(res.end(), keys.begin(), keys.end());
                     factor = 3;
                 }
-                // TODO array
                 if (p.type[0] == 'm') {
                     i += i + 2 + to_uint64(old_states[i+1]) * factor;
                 } else {
@@ -355,17 +369,17 @@ namespace evm4ccf
                 continue;
             }
             if (res.empty()) {
-                if (uninitialized) {
-                    decrypt_states({});
+                if (included_tee) {
+                    old_states = decrypt_states({{to_checksum_address(tee_addr()), to_hex_string(tee_public_key())}});
                 }
                 return false;
             }
             // function selector
             std::vector<uint8_t> data = to_bytes("0xa30e2625");
             std::vector<void*> codes;
-            abicoder::paramCoder(codes, "read", "uint256[]", res);
+            abicoder::paramCoder(codes, "read", "uint[]", res);
             auto params = abicoder::pack(codes);
-            data.insert(data.begin(), params.begin(), params.end());
+            data.insert(data.end(), params.begin(), params.end());
             nlohmann::json j;
             j["tx_hash"] = to_hex_string(hash());
             j["data"] = to_hex_string(data);
@@ -386,9 +400,9 @@ namespace evm4ccf
         Address             verifierAddr;
         Address             pkiAddr;
         ByteData            codeHash;
+        h256                policyHash;
         rpcparams::Policy              policy;
-        ByteString          pdata;
-        MSGPACK_DEFINE(from, to, verifierAddr, codeHash, policy);
+        MSGPACK_DEFINE(from, to, verifierAddr, codeHash, policy, pkiAddr, policyHash);
         PrivacyPolicyTransaction(){}
         PrivacyPolicyTransaction(const rpcparams::SendPrivacyPolicy &p) {
             from = p.from;
@@ -396,8 +410,8 @@ namespace evm4ccf
             verifierAddr = p.verifierAddr;
             pkiAddr = p.pkiAddr;
             codeHash = p.codeHash;
-            pdata =eevm::to_bytes( p.policy);
             policy = Utils::parse<Policy>(p.policy);
+            policyHash = keccak_256(to_bytes(p.policy));
             policy.sign_funtions_name();
             CLOAK_DEBUG_FMT("PrivacyPolicyTransaction info: {}\n", info());
         }
@@ -410,7 +424,8 @@ namespace evm4ccf
             tc.states = policy.states;
             tc.function = policy.get_funtions(name);
             tc.pkiAddr = pkiAddr;
-            tc.policy_hash = hash();
+            tc.policy_hash = policyHash;
+            CLOAK_DEBUG_FMT("policyHash:{}", policyHash);
         }
 
         void checkMptParams(const MultiPartyTransaction& mpt) const {
@@ -432,7 +447,7 @@ namespace evm4ccf
         }
 
         h256 hash() const {
-            return eevm::keccak_256(pdata);
+            return policyHash;
         }
 
         void serialized(uint8_t* &data, size_t &size) {
@@ -442,7 +457,7 @@ namespace evm4ccf
             serialized::write(data, size, codeHash);
             serialized::write(data, size, policy);
             serialized::write(data, size, pkiAddr);
-            // serialized::write(data, size, pdata.data(), pdata.size());
+            serialized::write(data, size, policyHash);
         }
 
         static PrivacyPolicyTransaction deserialize(
@@ -455,7 +470,8 @@ namespace evm4ccf
             p.codeHash = serialized::read<std::string>(data,size);
             p.policy = serialized::read<rpcparams::Policy>(data,size);
             p.pkiAddr = serialized::read<Address>(data,size);
-            // p.policy = Utils::parse<Policy>((char*)p.pdata.data());
+            p.policyHash = serialized::read<h256>(data, size);
+            CLOAK_DEBUG_FMT("policyHash:{}", p.policyHash);
             return p;
         }
 
@@ -464,8 +480,14 @@ namespace evm4ccf
         }
 
         std::string info() const {
-            return fmt::format("from: {}, to: {}, codeHash: {} \n \
-                    policy:{}\n", from, to, codeHash, policy.info());
+            return fmt::format(
+                "from: {}, to: {}, codeHash: {} \n \
+                    policy:{}, policyHash:{}\n",
+                from,
+                to,
+                codeHash,
+                policy.info(),
+                to_hex_string(policyHash));
         }
     };
 } // namespace evm4ccf

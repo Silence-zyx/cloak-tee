@@ -11,6 +11,7 @@
 #include "nlohmann/json.hpp"
 #include "tls/key_exchange.h"
 #include "tls/key_pair.h"
+#include "tls/pem.h"
 #include "vector"
 // eEVM
 #include <eEVM/address.h>
@@ -20,6 +21,21 @@
 #include <eEVM/util.h>
 // CCF
 #include <tls/entropy.h>
+
+#ifdef CLOAK_DEBUG_LOGGING
+#    define CLOAK_DEBUG_FMT(...) LOG_INFO_FMT(__VA_ARGS__)
+#else
+#    define CLOAK_DEBUG_FMT(...)
+#endif
+
+#ifndef LOG_AND_THROW
+#    define LOG_AND_THROW(...)                                \
+        do {                                                  \
+            CLOAK_DEBUG_FMT(__VA_ARGS__);                     \
+            throw std::logic_error(fmt::format(__VA_ARGS__)); \
+        } while (false);
+#endif
+
 namespace Utils 
 {
     inline std::string BinaryToHex(
@@ -140,8 +156,8 @@ namespace Utils
     }
 
     // generate symmetric key using ECDH and HKDF
-    inline std::vector<uint8_t> generate_symmetric_key(tls::KeyPairPtr kp, const std::string& pk_str) {
-        auto pk = tls::make_public_key(eevm::to_bytes(pk_str));
+    inline std::vector<uint8_t> generate_symmetric_key(tls::KeyPairPtr kp, const tls::Pem& pk_pem) {
+        auto pk = tls::make_public_key(pk_pem);
         auto ctx = tls::KeyExchangeContext(kp, pk);
         auto ikm = ctx.compute_shared_secret();
         auto info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
@@ -150,51 +166,32 @@ namespace Utils
         return key;
     }
 
-    inline std::vector<uint8_t> encrypt_data(
-        tls::KeyPairPtr kp, const std::string& pk_str, 
-        const std::vector<uint8_t>& iv, const std::vector<uint8_t>& data) {
-        auto key = generate_symmetric_key(kp, pk_str);
+    using Bytes = std::vector<uint8_t>;
+    inline std::pair<Bytes, Bytes> encrypt_data_s(
+        tls::KeyPairPtr kp, const tls::Pem& pk_pem, const std::vector<uint8_t>& iv, const std::vector<uint8_t>& data) {
+        auto key = generate_symmetric_key(kp, pk_pem);
         crypto::KeyAesGcm key_aes_gcm(key);
         std::vector<uint8_t> res(data.size());
         std::vector<uint8_t> tag(crypto::GCM_SIZE_TAG);
         key_aes_gcm.encrypt(iv, data, {}, res.data(), tag.data());
-        res.insert(res.begin(), tag.begin(), tag.end());
-        return res;
-    }
-
-    using Bytes = std::vector<uint8_t>;
-    inline std::pair<Bytes, Bytes> encrypt_data_s(
-        tls::KeyPairPtr kp,
-        const std::string& pk_str,
-        const std::vector<uint8_t>& iv,
-        const std::vector<uint8_t>& data) {
-        Bytes encrypted = encrypt_data(kp, pk_str, iv, data);
-        size_t size = encrypted.size() - crypto::GCM_SIZE_TAG;
-        return {{encrypted.begin(), encrypted.begin() + size}, {encrypted.begin() + size, encrypted.end()}};
+        return {res, tag};
     }
 
     inline std::vector<uint8_t> decrypt_data(
-        tls::KeyPairPtr kp, const std::string& pk_str, 
-        const std::vector<uint8_t>& iv, const std::vector<uint8_t>& data) {
-        auto key = generate_symmetric_key(kp, pk_str);
+        tls::KeyPairPtr kp, const tls::Pem& pk_pem, const std::vector<uint8_t>& iv, const std::vector<uint8_t>& data) {
+        auto key = generate_symmetric_key(kp, pk_pem);
         crypto::KeyAesGcm key_aes_gcm(key);
         size_t c_size = data.size() - crypto::GCM_SIZE_TAG;
         std::vector<uint8_t> res(c_size);
-        key_aes_gcm.decrypt(iv, data.data() + c_size, {data.data(), c_size}, {}, res.data());
+        if (!key_aes_gcm.decrypt(iv, data.data() + c_size, {data.data(), c_size}, {}, res.data())) {
+            CLOAK_DEBUG_FMT("decryption failed, please check your data");
+        }
         return res;
     }
+
+    inline std::pair<Bytes, Bytes> split_tag_and_iv(const Bytes& ti) {
+        Bytes tag{ti.begin(), ti.begin() + crypto::GCM_SIZE_TAG};
+        Bytes iv{ti.begin() + crypto::GCM_SIZE_TAG, ti.begin() + crypto::GCM_SIZE_TAG + crypto::GCM_SIZE_IV};
+        return {tag, iv};
+    }
 }
-
-#ifdef CLOAK_DEBUG_LOGGING
-#    define CLOAK_DEBUG_FMT(...) LOG_INFO_FMT(__VA_ARGS__)
-#else
-#    define CLOAK_DEBUG_FMT(...)
-#endif
-
-#ifndef LOG_AND_THROW
-#    define LOG_AND_THROW(...)                                \
-        do {                                                  \
-            CLOAK_DEBUG_FMT(__VA_ARGS__);                     \
-            throw std::logic_error(fmt::format(__VA_ARGS__)); \
-        } while (false);
-#endif

@@ -9,6 +9,7 @@
 
 #include <eEVM/rlp.h>
 #include <eEVM/util.h>
+#include <stdint.h>
 
 namespace evm4ccf
 {

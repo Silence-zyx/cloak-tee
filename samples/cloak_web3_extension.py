@@ -6,10 +6,10 @@ def sendPrivacyPolicy(self, codeHash, privacy_policy):
         [codeHash, privacy_policy],
     )
 
-def sendPrivacyPolicy_v2(self, f, t, v, privacy_policy):
+def sendPrivacyPolicy(self, f, t, code_hash, v, p, pki_addr):
     return self.web3.manager.request_blocking(
         "cloak_sendPrivacyPolicy",
-        {"from": f, "to": t, "verifierAddr": v, "policy": privacy_policy}
+        {"from": f, "to": t, "codeHash": code_hash, "verifierAddr": v, "policy": p, "pkiAddr": pki_addr}
     )
 
 def sendOnchainContract(self, to, contract_abi):

@@ -423,7 +423,7 @@ namespace evm4ccf
           auto old_states = decode_uint256_array(to_bytes(params["data"].get<std::string>()));
           h256 tx_hash = Utils::to_KeccakHash(params["tx_hash"].get<std::string>());
           std::vector<void*> codes;
-          abicoder::paramCoder(codes, "oldStates", "uint256[]", old_states);
+          abicoder::paramCoder(codes, "oldStates", "uint[]", old_states);
           auto old_states_packed = abicoder::pack(codes);
           auto old_states_hash = eevm::keccak_256(old_states_packed);
 
@@ -439,10 +439,12 @@ namespace evm4ccf
           }
           ct->old_states = old_states;
           ct->old_states_hash = old_states_hash;
+          CLOAK_DEBUG_FMT("old_states:{}", fmt::join(ct->old_states, ", "));
           if (ct->request_public_keys()) {
               return true;
           }
           execute_mpt(workerQueue, ct->old_states, tx_hash, tx, nonce);
+          nonce++;
           return true;
       };
     
@@ -460,7 +462,9 @@ namespace evm4ccf
           for (size_t i = 0; i < public_key_list.size(); i++) {
               public_keys.insert(std::make_pair(public_key_list[i], public_key_list[i+1]));
           }
+          public_keys[to_checksum_address(ct->tee_addr())] = to_hex_string(ct->tee_public_key());
           std::vector<std::string> decrypted = ct->decrypt_states(public_keys);
+          nonce++;
           execute_mpt(workerQueue, decrypted, tx_hash, tx, nonce);
           // TODO response
           return true;
@@ -475,6 +479,7 @@ namespace evm4ccf
           mc.to = cloak_service_addr;
           mc.data = to_hex_string(data);
           auto signed_data = sign_eth_tx(tee_kp, mc, nonce);
+          nonce++;
           Utils::cloak_agent_log("register_tee_addr", to_hex_string(signed_data));
           return true;
       };
@@ -673,25 +678,26 @@ namespace evm4ccf
                      h256 tx_hash, kv::Tx& tx, size_t nonce) {
         auto ct_opt = workerQueue.GetCloakTransaction(tx_hash);
         if (!ct_opt.has_value()) {
-            // TODO
             return;
         }
         auto ct = ct_opt.value();
         MessageCall set_states_mc;
         std::vector<void*> codes;
-        abicoder::paramCoder(codes, "set_states", "uint256[]", decryped_states);
+        abicoder::paramCoder(codes, "set_states", "uint[]", decryped_states);
         auto decryped_states_packed = abicoder::pack(codes);
         // function selector
-        auto set_states_call_data = eevm::to_bytes("a30e2625");
+        auto set_states_call_data = Utils::make_function_selector("set_states(uint256[])");
+        CLOAK_DEBUG_FMT("decryped_states:{}", fmt::join(decryped_states, ", "));
         set_states_call_data.insert(
-            set_states_call_data.begin(), decryped_states_packed.begin(), decryped_states_packed.end());
+            set_states_call_data.end(), decryped_states_packed.begin(), decryped_states_packed.end());
         set_states_mc.from = ct->tee_addr();
         set_states_mc.to = ct->to;
+        CLOAK_DEBUG_FMT("call_data:{}", eevm::to_hex_string(set_states_call_data));
         set_states_mc.data = eevm::to_hex_string(set_states_call_data);
         auto set_states_es = make_state(tx);
         auto set_states_res = run_in_evm(set_states_mc, set_states_es).first;
         if (set_states_res.er == ExitReason::threw) {
-            // TODO
+            CLOAK_DEBUG_FMT("set_states execution error: {}", set_states_res.exmsg);
             return;
         }
         // run in evm
@@ -708,27 +714,29 @@ namespace evm4ccf
         CLOAK_DEBUG_FMT("run in evm, res: {}, msg: {}\n", res.output, res.exmsg);
         if (res.er == ExitReason::threw) {
             ct->set_status(FAILED);
+            return;
         } else {
             ct->set_status(SUCCEEDED);
         }
 
         // == get new states ==
         MessageCall get_new_states_mc;
-        auto get_new_states_call_data = ct->get_states_call_data(true);
-        codes.clear();
-        set_states_mc.from = ct->tee_addr();
-        set_states_mc.to = ct->to;
-        set_states_mc.data = eevm::to_hex_string(get_new_states_call_data);
+        auto get_new_states_call_data = ct->get_states_call_data(false);
+        CLOAK_DEBUG_FMT("get_new_states_call_data:{}", to_hex_string(get_new_states_call_data));
+        get_new_states_mc.from = ct->tee_addr();
+        get_new_states_mc.to = ct->to;
+        get_new_states_mc.data = eevm::to_hex_string(get_new_states_call_data);
         auto get_new_states_es = make_state(tx);
         auto get_new_states_res = run_in_evm(get_new_states_mc, get_new_states_es).first;
+        CLOAK_DEBUG_FMT("get_new_states res:{}, {}, {}, {}", get_new_states_res.er, get_new_states_res.ex, to_hex_string(get_new_states_res.output), get_new_states_res.exmsg);
         if (get_new_states_res.er == ExitReason::threw) {
-            // TODO
             return;
         }
 
         // == Sync new states ==
         std::vector<std::string> new_states = decode_uint256_array(get_new_states_res.output);
         auto encrypted = ct->encrypt_states(new_states);
+        CLOAK_DEBUG_FMT("encrypted:{}", fmt::join(encrypted, ", "));
         ct->sync_result(encrypted, nonce);
         // TODO response
     }
@@ -736,12 +744,14 @@ namespace evm4ccf
     static std::vector<std::string> decode_uint256_array(const std::vector<uint8_t>& states) {
         std::vector<uint8_t> count_vec(states.begin() + 32, states.begin() + 64);
         std::vector<std::string> res;
-        size_t count = to_uint64(to_hex_string(count_vec));
+        size_t count = size_t(to_uint256(to_hex_string(count_vec)));
+        CLOAK_DEBUG_FMT("count:{}", count);
         for (size_t i = 0; i < count; i++) {
-            auto it = states.begin() + 64 + i * 256;
-            std::vector<uint8_t> state(it, it+256);
+            auto it = states.begin() + 64 + i * 32;
+            std::vector<uint8_t> state(it, it+32);
             res.push_back(to_hex_string(state));
         }
+        CLOAK_DEBUG_FMT("res:{}", fmt::join(res, ", "));
         return res;
     }
 

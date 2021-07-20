@@ -8,6 +8,8 @@ import provider
 import ccf_network_config as config
 import json
 from loguru import logger as LOG
+import subprocess
+from eth_hash.auto import keccak as keccak_256
 
 class EvmTestContract:
     def __init__(self, contract):
@@ -62,7 +64,6 @@ def read_evmtest_params_from_file():
 
 def signMpt(private_key, frm, to, data, nonce=1):
     import rlp
-    from eth_hash.auto import keccak as keccak_256
     from_int = int(frm, 0)
     to_int = int(to, 0)
     params = rlp.encode([nonce, from_int, to_int, data])
@@ -102,15 +103,18 @@ def test_deploy(ccf_client):
     deploy_receipt = owner.send_signed(
         evmtest_spec.constructor(10000, [11, 12, 13]))
 
-    evmtest_policy = read_evmtest_policy_from_file()
-    sppr = owner.sendPrivacyPolicy_v2(owner.account.address, deploy_receipt.contractAddress, "", evmtest_policy)
-    mpt_data = read_evmtest_params_from_file()
-    mpt_params = signMpt(owner.account.key, owner.account.address, deploy_receipt.contractAddress, mpt_data)
-    smptr = owner.sendMultiPartyTransaction(mpt_params)
+    # cf = w3.eth.call({"to": deploy_receipt.contractAddress, "data": "0x8e86b12500000000000000000000000000000000000000000000000000000000000000050000000000000000000000000000000000000000000000000000000000000005"})
+    # print(f"HeY: {cf}")
 
-    ccf_client.evmtest_contract_address = deploy_receipt.contractAddress
-    print(deploy_receipt.contractAddress)
-    ccf_client.owner_account = owner.account
+    # evmtest_policy = read_evmtest_policy_from_file()
+    # sppr = owner.sendPrivacyPolicy(owner.account.address, deploy_receipt.contractAddress, "", evmtest_policy)
+    # mpt_data = read_evmtest_params_from_file()
+    # mpt_params = signMpt(owner.account.key, owner.account.address, deploy_receipt.contractAddress, mpt_data)
+    # smptr = owner.sendMultiPartyTransaction(mpt_params)
+
+    # ccf_client.evmtest_contract_address = deploy_receipt.contractAddress
+    # print(deploy_receipt.contractAddress)
+    # ccf_client.owner_account = owner.account
 
     return ccf_client
 
@@ -156,6 +160,59 @@ def get_balance(ccf_client):
     chaind = w3.eth.estimateGas(params)
     print(chaind)
 
+
+def read_income_mpt_data():
+    text = """
+    {
+        "function": "set",
+        "inputs" : [
+            { "name": "_a", "value": "100"}
+        ]
+    }
+    """
+    print(json.loads(text))
+    return web3.Web3.toHex(text=text)
+
+def cloak_prepare(ccf_client: ccf.clients.CCFClient, cloak_service_addr: str):
+    ccf_client.call("/app/cloak_prepare", {"cloak_service_addr": cloak_service_addr})
+
+def test_mpt(ccf_client):
+    compile_dir = os.environ["HOME"] + "/git/cloak-compiler/test/output/"
+    w3 = web3.Web3(provider.CCFProvider(ccf_client))
+    owner = Caller(web3.Account.create(), w3)
+    print(f"owner:{owner.account.address}")
+    file_path = compile_dir + "private_contract.sol"
+    process = subprocess.Popen([
+        os.environ["HOME"] + "/.solcx/solc-v0.6.12",
+        "--combined-json", "abi,bin,bin-runtime,hashes", "--evm-version", "homestead", "--optimize",
+        file_path
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = process.communicate()
+    cj = json.loads(out)
+    income = cj["contracts"][f"{file_path}:Income"]
+    abi = income["abi"]
+    bi = income["bin"]
+    print(f"hashs:{income['hashes']}")
+    codeHash = web3.Web3.keccak(open(file_path, 'rb').read())
+    spec = w3.eth.contract(abi=abi, bytecode=bi)
+    deployed_receipt = owner.send_signed(spec.constructor())
+    print(f"deployed_addr:{deployed_receipt.contractAddress}")
+
+    policy = None
+    with open(compile_dir + "policy.json", mode='rb') as f:
+        policy = web3.Web3.toHex(f.read())
+    print(f"pt:{type(policy)}, ph:{web3.Web3.keccak(hexstr=policy).hex()}")
+    res = owner.sendPrivacyPolicy(owner.account.address, deployed_receipt.contractAddress, codeHash.hex(),
+            "0x43552b1518Cbcc4eB14b5600F596D4287975B2d0", policy, "0x912FB2881433F9EEA86073eec44D7F1648fdbf2B")
+    print(f"res:{res}")
+
+    # mpt
+    mpt_data = read_income_mpt_data()
+    mpt_params = signMpt(owner.account.key, owner.account.address, deployed_receipt.contractAddress, mpt_data)
+    smptr = owner.sendMultiPartyTransaction(mpt_params)
+    print(f"mpt res:{smptr}")
+
+
 if __name__ == "__main__":
 
     ccf_client = ccf.clients.CCFClient(
@@ -165,6 +222,10 @@ if __name__ == "__main__":
         config.cert, 
         config.key
         )
+    # prepare ccf
+    # cloak_prepare(ccf_client, "0xb3B7074aB6D65BDbaB96424A76EB23495d3787B4")
+    test_mpt(ccf_client)
+    # test_test(ccf_client)
     # get_balance(ccf_client)
-    test_deploy(ccf_client)
-    test_get_sum(ccf_client)
+    # test_deploy(ccf_client)
+    # test_get_sum(ccf_client)

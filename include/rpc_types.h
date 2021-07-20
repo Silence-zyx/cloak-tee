@@ -154,7 +154,7 @@ static std::unordered_map<ByteData, int> contractType = {
       std::vector<Params> outputs;
 
       void sign_function_name() {
-        LOG_DEBUG_FMT("original function name:{}", name);
+        CLOAK_DEBUG_FMT("original function name:{}", name);
         std::string signed_name = name + "(";
         bool first = true;
         for (auto &&p : inputs) {
@@ -166,7 +166,7 @@ static std::unordered_map<ByteData, int> contractType = {
             first = false;
         }
         signed_name += ")";
-        LOG_DEBUG_FMT("signed name:{}", signed_name);
+        CLOAK_DEBUG_FMT("signed name:{}", signed_name);
         auto sha3 = eevm::keccak_256(signed_name);
         signedName = UINT8ARRAY(sha3.begin(), sha3.begin()+4);
       }
@@ -201,7 +201,7 @@ static std::unordered_map<ByteData, int> contractType = {
       }
 
       std::string info() const {
-          std::string s = fmt::format("name:{}, type:{}\n", name, type);
+          std::string s = fmt::format("name:{}, signedName:{}, type:{}\n", name, signedName, type);
           for (auto &&i : inputs) {
               s.append(i.info());
           }
